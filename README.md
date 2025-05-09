@@ -1,6 +1,5 @@
 
 
-````markdown
 # Online Goal Inference Modeling
 
 <div align="center">
