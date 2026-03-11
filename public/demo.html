@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bayesian Goal Inference — Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #08090d;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        canvas#demo {
+            border-radius: 10px;
+            box-shadow: 0 25px 80px rgba(0,0,0,0.6);
+        }
+        .controls {
+            margin-top: 24px;
+            display: flex;
+            gap: 12px;
+        }
+        button {
+            background: #1e293b;
+            color: #94a3b8;
+            border: 1px solid #334155;
+            padding: 10px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-family: inherit;
+            transition: all 0.2s;
+        }
+        button:hover { background: #334155; color: #e2e8f0; }
+        button:active { transform: scale(0.97); }
+        button.recording { background: #7f1d1d; border-color: #991b1b; color: #fca5a5; }
+    </style>
+</head>
+<body>
+    <canvas id="demo" width="840" height="540"></canvas>
+    <div class="controls">
+        <button id="exportBtn">Export Video (280 x 180)</button>
+    </div>
+
+<script>
+// ════════════════════════════════════════════
+// CONFIG
+// ════════════════════════════════════════════
+const canvas = document.getElementById('demo');
+const ctx = canvas.getContext('2d');
+const W = 840, H = 540;
+
+const C = {
+    bg:         '#0f1117',
+    panelBg:    '#12141e',
+    gridBg:     '#151827',
+    gridLine:   'rgba(255,255,255,0.035)',
+    block:      '#241f3a',
+    blockEdge:  '#342d52',
+    goals:      ['#f59e0b', '#10b981', '#8b5cf6'],
+    goalGlow:   ['rgba(245,158,11,', 'rgba(16,185,129,', 'rgba(139,92,246,'],
+    player:     '#38bdf8',
+    playerGlow: 'rgba(56,189,248,0.35)',
+    text:       '#e2e8f0',
+    textSec:    '#94a3b8',
+    textMuted:  '#575e70',
+    barTrack:   'rgba(255,255,255,0.05)',
+    divider:    'rgba(255,255,255,0.06)',
+};
+
+// Layout
+const GX = 28, GY = 52;
+const GS = 420;          // grid pixel size
+const CELL = GS / 10;   // 42
+const PX = 478;          // right-panel left
+const PW = 335;          // right-panel width
+
+// ════════════════════════════════════════════
+// DEMO DATA
+// ════════════════════════════════════════════
+const GRID_N = 10;
+const BLOCKS = [[4,1],[4,2],[4,3],[4,5],[4,6],[4,7],[4,8],[4,9]];
+const GOALS  = [[0,9],[9,0],[9,9]];
+const GLABELS = ['G\u2081','G\u2082','G\u2083'];
+
+const PATH = [
+    [0,0],[1,0],[2,0],[3,0],[4,0],[5,0],
+    [5,1],[5,2],[5,3],[6,3],[6,4],[7,4],
+    [7,5],[8,5],[8,6],[9,6],[9,7],[9,8],[9,9]
+];
+
+const POST = [
+    [.333,.333,.333],[.18,.41,.41],[.08,.46,.46],[.04,.48,.48],
+    [.02,.49,.49],[.01,.49,.50],[.01,.40,.59],[.01,.32,.67],
+    [.01,.25,.74],[.01,.20,.79],[.01,.15,.84],[.01,.12,.87],
+    [.01,.09,.90],[.01,.07,.92],[.01,.05,.94],[.01,.04,.95],
+    [.01,.03,.96],[.01,.02,.97],[.01,.01,.98]
+];
+
+// ════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════
+const MOVE_MS  = 480;
+const WAIT_MS  = 380;
+const DONE_MS  = 2600;
+const INIT_MS  = 1200;
+
+let step = 0;
+let phase = 'waiting';   // moving | waiting | done
+let moveT = 1;
+let moveStart = 0;
+let waitUntil = 0;
+let dispPost = [.333,.333,.333];
+let targPost = [.333,.333,.333];
+let trail = [];           // indices into PATH
+
+// ════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════
+function ease(t){ return t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2; }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function cp(cx,cy){ return [GX+cx*CELL+CELL/2, GY+cy*CELL+CELL/2]; }
+
+function rr(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+}
+
+// ════════════════════════════════════════════
+// DRAWING
+// ════════════════════════════════════════════
+function drawBg(){
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0,0,W,H);
+
+    // Title
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '600 11px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('ONLINE  BAYESIAN  GOAL  INFERENCE', W/2, 28);
+
+    // Top rule
+    ctx.strokeStyle = C.divider;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(28,40); ctx.lineTo(W-28,40); ctx.stroke();
+
+    // Bottom rule
+    ctx.beginPath(); ctx.moveTo(28,H-18); ctx.lineTo(W-28,H-18); ctx.stroke();
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('Baker et al. 2009 · Zhi-Xuan et al. 2020', W-30, H-6);
+}
+
+function drawGrid(){
+    // Background
+    rr(GX-1, GY-1, GS+2, GS+2, 5);
+    ctx.fillStyle = C.gridBg;
+    ctx.fill();
+
+    // Cells
+    ctx.strokeStyle = C.gridLine;
+    ctx.lineWidth = 1;
+    for(let i=0;i<=GRID_N;i++){
+        ctx.beginPath();
+        ctx.moveTo(GX+i*CELL, GY);
+        ctx.lineTo(GX+i*CELL, GY+GS);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(GX, GY+i*CELL);
+        ctx.lineTo(GX+GS, GY+i*CELL);
+        ctx.stroke();
+    }
+}
+
+function drawBlocks(){
+    BLOCKS.forEach(([bx,by])=>{
+        const px=GX+bx*CELL+1.5, py=GY+by*CELL+1.5, sz=CELL-3;
+        rr(px,py,sz,sz,3);
+        ctx.fillStyle = C.block;
+        ctx.fill();
+        ctx.strokeStyle = C.blockEdge;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+    });
+}
+
+function drawGoals(t){
+    GOALS.forEach(([gx,gy],i)=>{
+        const px=GX+gx*CELL, py=GY+gy*CELL;
+        const pulse = .5+.5*Math.sin(t/900+i*2.2);
+        const pv = dispPost[i];
+
+        // Glow halo
+        ctx.save();
+        ctx.shadowColor = C.goals[i];
+        ctx.shadowBlur = 6 + pulse*6 + pv*12;
+        rr(px+3,py+3,CELL-6,CELL-6,5);
+        ctx.fillStyle = C.goals[i];
+        ctx.globalAlpha = .15 + pv*.55;
+        ctx.fill();
+        ctx.restore();
+
+        // Solid cell
+        rr(px+2,py+2,CELL-4,CELL-4,4);
+        ctx.fillStyle = C.goals[i];
+        ctx.globalAlpha = .18 + pv*.55;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        // Label
+        ctx.fillStyle = '#fff';
+        ctx.globalAlpha = .65 + pv*.35;
+        ctx.font = 'bold 13px -apple-system, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(GLABELS[i], px+CELL/2, py+CELL/2);
+        ctx.globalAlpha = 1;
+    });
+}
+
+function drawTrail(){
+    for(let i=0;i<trail.length;i++){
+        const age = trail.length-1-i;
+        const alpha = Math.max(.02, .22 - age*.012);
+        const [cx,cy] = PATH[trail[i]];
+        rr(GX+cx*CELL+2, GY+cy*CELL+2, CELL-4, CELL-4, 3);
+        ctx.fillStyle = `rgba(56,189,248,${alpha})`;
+        ctx.fill();
+    }
+}
+
+function drawPlayer(t){
+    let px, py;
+    if(phase==='moving' && step>0){
+        const [fx,fy]=PATH[step-1], [tx,ty]=PATH[step];
+        const e = ease(moveT);
+        px = GX + lerp(fx,tx,e)*CELL + CELL/2;
+        py = GY + lerp(fy,ty,e)*CELL + CELL/2;
+    } else {
+        const [cx,cy] = PATH[Math.min(step,PATH.length-1)];
+        px = GX+cx*CELL+CELL/2;
+        py = GY+cy*CELL+CELL/2;
+    }
+
+    const pulse = .75 + .25*Math.sin(t/280);
+
+    // Outer glow
+    ctx.save();
+    ctx.shadowColor = C.player;
+    ctx.shadowBlur = 18*pulse;
+    ctx.beginPath();
+    ctx.arc(px,py,CELL*.33,0,Math.PI*2);
+    ctx.fillStyle = C.player;
+    ctx.fill();
+    ctx.restore();
+
+    // Inner highlight
+    ctx.beginPath();
+    ctx.arc(px,py,CELL*.14,0,Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fill();
+}
+
+// ── Right Panel ─────────────────────────────
+function drawPanel(t){
+    // Panel bg
+    rr(PX-8, GY-1, PW+16, GS+2, 5);
+    ctx.fillStyle = C.panelBg;
+    ctx.fill();
+
+    let y = GY + 22;
+    const lx = PX + 12;   // left text margin
+    const rx = PX+PW+2;   // right text margin
+
+    // ── Section: Math ──
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '600 10px -apple-system, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('BAYESIAN  INFERENCE', lx, y);
+    y += 28;
+
+    // Equation 1: Bayes rule
+    ctx.fillStyle = C.text;
+    ctx.font = 'italic 15.5px Georgia, "Times New Roman", serif';
+    ctx.fillText('P(G \u2223 a', lx, y);
+    ctx.font = '9.5px Georgia, serif';
+    ctx.fillText('1:t', lx+61, y+3);
+    ctx.font = 'italic 15.5px Georgia, serif';
+    ctx.fillText(') \u221D P(a', lx+75, y);
+    ctx.font = '9.5px Georgia, serif';
+    ctx.fillText('1:t', lx+131, y+3);
+    ctx.font = 'italic 15.5px Georgia, serif';
+    ctx.fillText('\u2223 G) \u00B7 P(G)', lx+145, y);
+    y += 32;
+
+    // Equation 2: softmax
+    ctx.fillStyle = C.textSec;
+    ctx.font = 'italic 13.5px Georgia, serif';
+    ctx.fillText('P(a \u2223 s, G) \u221D exp( Q(s,a,G) / \u03C4 )', lx, y);
+    y += 22;
+
+    // Parameter note
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '11px -apple-system, sans-serif';
+    ctx.fillText('\u03C4 = 5   (bounded rationality)', lx, y);
+    y += 14;
+
+    // Decay note
+    ctx.fillText('\u03BB = 0.9  (prior temporal decay)', lx, y);
+    y += 22;
+
+    // Divider
+    ctx.strokeStyle = C.divider;
+    ctx.beginPath(); ctx.moveTo(PX, y); ctx.lineTo(PX+PW, y); ctx.stroke();
+    y += 22;
+
+    // ── Section: Posterior ──
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '600 10px -apple-system, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('POSTERIOR   P(G \u2223 a\u2081:\u209C)', lx, y);
+    y += 24;
+
+    const barW = PW - 80;
+    const barH = 26;
+    const gap = 18;
+
+    for(let i=0;i<3;i++){
+        const by = y + i*(barH+gap);
+
+        // Goal label
+        ctx.fillStyle = C.goals[i];
+        ctx.font = 'bold 14px -apple-system, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(GLABELS[i], lx, by+barH/2);
+
+        // Track
+        const bx = lx + 35;
+        rr(bx, by, barW, barH, 5);
+        ctx.fillStyle = C.barTrack;
+        ctx.fill();
+
+        // Fill
+        const fw = Math.max(3, barW * dispPost[i]);
+        rr(bx, by, fw, barH, 5);
+
+        // Gradient fill
+        const grad = ctx.createLinearGradient(bx,by,bx+fw,by);
+        grad.addColorStop(0, C.goals[i]);
+        grad.addColorStop(1, C.goals[i]+'cc');
+        ctx.fillStyle = grad;
+        ctx.globalAlpha = .85;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        // Percentage
+        const pct = (dispPost[i]*100).toFixed(1);
+        ctx.fillStyle = C.text;
+        ctx.font = '500 12px -apple-system, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(pct+'%', rx, by+barH/2);
+    }
+    ctx.textBaseline = 'alphabetic';
+
+    // Step counter
+    y += 3*(barH+gap) + 18;
+    ctx.fillStyle = C.textMuted;
+    ctx.font = '12px -apple-system, sans-serif';
+    ctx.textAlign = 'left';
+
+    // Step bar
+    const sbx = lx, sbw = PW-10, sbh = 4;
+    rr(sbx, y, sbw, sbh, 2);
+    ctx.fillStyle = C.barTrack;
+    ctx.fill();
+    const prog = step/(PATH.length-1);
+    rr(sbx, y, Math.max(2, sbw*prog), sbh, 2);
+    ctx.fillStyle = C.player;
+    ctx.globalAlpha = .5;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    y += 16;
+    ctx.fillStyle = C.textMuted;
+    ctx.fillText(`Step ${step} / ${PATH.length-1}`, lx, y);
+
+    // Grid legend
+    y += 28;
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.fillStyle = C.textMuted;
+    ctx.fillText('\u25CF  Agent          \u25A0  Goal          \u25A0  Obstacle', lx, y);
+    // Colored dots for legend
+    ctx.fillStyle = C.player;
+    ctx.fillText('\u25CF', lx, y);
+    ctx.fillStyle = C.goals[0];
+    ctx.fillText('\u25A0', lx+82, y);
+    ctx.fillStyle = C.blockEdge;
+    ctx.fillText('\u25A0', lx+164, y);
+    ctx.fillStyle = C.textMuted;
+    ctx.fillText('  Agent', lx+9, y);
+    ctx.fillText('  Goal', lx+91, y);
+    ctx.fillText('  Obstacle', lx+173, y);
+}
+
+// ── Goal-reached effect ─────────────────────
+let reachAlpha = 0;
+function drawReachEffect(t){
+    if(phase==='done' && reachAlpha > 0){
+        const [gx,gy] = GOALS[2]; // G3
+        const px = GX+gx*CELL+CELL/2;
+        const py = GY+gy*CELL+CELL/2;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(px, py, CELL*1.2 + (1-reachAlpha)*CELL*2, 0, Math.PI*2);
+        ctx.strokeStyle = C.goals[2];
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = reachAlpha * .6;
+        ctx.stroke();
+        ctx.restore();
+        reachAlpha = Math.max(0, reachAlpha - .008);
+    }
+}
+
+// ════════════════════════════════════════════
+// ANIMATION LOOP
+// ════════════════════════════════════════════
+function reset(){
+    step = 0;
+    moveT = 1;
+    phase = 'waiting';
+    dispPost = [.333,.333,.333];
+    targPost = [.333,.333,.333];
+    trail = [];
+    reachAlpha = 0;
+}
+
+function animate(ts){
+    // ── State machine ──
+    switch(phase){
+        case 'waiting':
+            if(ts >= waitUntil){
+                if(step < PATH.length-1){
+                    step++;
+                    trail.push(step-1);
+                    phase = 'moving';
+                    moveT = 0;
+                    moveStart = ts;
+                    targPost = [...POST[step]];
+                } else {
+                    phase = 'done';
+                    trail.push(step);
+                    reachAlpha = 1;
+                    waitUntil = ts + DONE_MS;
+                }
+            }
+            break;
+        case 'moving':
+            moveT = Math.min(1, (ts-moveStart)/MOVE_MS);
+            if(moveT >= 1){
+                phase = 'waiting';
+                waitUntil = ts + WAIT_MS;
+            }
+            break;
+        case 'done':
+            if(ts >= waitUntil){
+                reset();
+                waitUntil = ts + INIT_MS;
+            }
+            break;
+    }
+
+    // Smooth posterior interpolation
+    for(let i=0;i<3;i++){
+        dispPost[i] += (targPost[i] - dispPost[i]) * .09;
+    }
+
+    // ── Draw ──
+    drawBg();
+    drawGrid();
+    drawTrail();
+    drawBlocks();
+    drawGoals(ts);
+    drawPlayer(ts);
+    drawPanel(ts);
+    drawReachEffect(ts);
+
+    // Copy to export canvas if recording
+    if(isRecording && expCanvas){
+        expCtx.drawImage(canvas, 0, 0, 280, 180);
+    }
+
+    requestAnimationFrame(animate);
+}
+
+// Kick off
+waitUntil = performance.now() + INIT_MS;
+requestAnimationFrame(animate);
+
+// ════════════════════════════════════════════
+// VIDEO EXPORT
+// ════════════════════════════════════════════
+let isRecording = false;
+let expCanvas, expCtx;
+
+document.getElementById('exportBtn').addEventListener('click', ()=>{
+    if(isRecording) return;
+    const btn = document.getElementById('exportBtn');
+
+    // Create export canvas at target resolution
+    expCanvas = document.createElement('canvas');
+    expCanvas.width = 280;
+    expCanvas.height = 180;
+    expCtx = expCanvas.getContext('2d');
+
+    // Reset demo to start
+    reset();
+    waitUntil = performance.now() + 600;
+
+    const stream = expCanvas.captureStream(30);
+    const recorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+            ? 'video/webm;codecs=vp9'
+            : 'video/webm',
+        videoBitsPerSecond: 2_000_000
+    });
+
+    const chunks = [];
+    recorder.ondataavailable = e => { if(e.data.size>0) chunks.push(e.data); };
+    recorder.onstop = () => {
+        const blob = new Blob(chunks, {type:'video/webm'});
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'bayesian_goal_inference_280x180.webm';
+        a.click();
+        setTimeout(()=> URL.revokeObjectURL(a.href), 5000);
+        btn.textContent = 'Export Video (280 \u00D7 180)';
+        btn.classList.remove('recording');
+        isRecording = false;
+    };
+
+    isRecording = true;
+    btn.textContent = 'Recording\u2026';
+    btn.classList.add('recording');
+    recorder.start();
+
+    // Duration: one full loop plus buffers
+    const dur = INIT_MS + (PATH.length-1)*(MOVE_MS+WAIT_MS) + DONE_MS + 1500;
+    setTimeout(()=>{
+        recorder.stop();
+        isRecording = false;
+        expCanvas = null;
+    }, dur);
+});
+</script>
+</body>
+</html>
